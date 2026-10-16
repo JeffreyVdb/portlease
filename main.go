@@ -434,6 +434,10 @@ func waitForChild(cmd *exec.Cmd) (int, error) {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
+		// ExitCode returns -1 for signal deaths; use the shell convention.
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			return 128 + int(status.Signal()), nil
+		}
 		return exitErr.ExitCode(), nil
 	}
 	return 0, fmt.Errorf("wait for child: %w", err)
@@ -522,7 +526,7 @@ Output contract:
   Every allocation includes a "guarantee" field. Read it before acting.
   Success exits 0. Operational errors are one JSON object on stderr.
   Calling portlease without a command prints this help and exits 2.
-  run/exec return the child's exit status.
+  run/exec return the child's exit status, or 128 + signal if killed by a signal.
 
 Allocation scope:
   A port is scoped by network, address, and Linux network namespace.

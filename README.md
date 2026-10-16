@@ -40,6 +40,9 @@ child starts. Child stdout remains clean. Keep the wrapped command in the
 foreground; if it daemonizes and exits before its descendants bind, the
 cooperative lease ends too early.
 
+Both `run` and `exec` return the child's exit code. If a signal kills the child,
+they return `128 + signal number`, such as 130 for SIGINT (Ctrl-C).
+
 `run` closes its listeners just before starting the child because ordinary
 servers need to call `bind(2)` themselves. The state-file lease prevents races
 with other cooperating `portlease` callers, but an unrelated process can still

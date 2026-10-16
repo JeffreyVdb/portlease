@@ -13,14 +13,18 @@ import (
 	"unsafe"
 )
 
-// TestRunWrapperHelper runs `portlease run` as a real process so tests can
+// TestRunWrapperHelper runs `portlease run` or `exec` as a real process so tests can
 // kill it or attach it to a terminal.
 func TestRunWrapperHelper(t *testing.T) {
 	if os.Getenv("PORTLEASE_WRAPPER_HELPER") != "1" {
 		return
 	}
+	mode := os.Getenv("PORTLEASE_WRAPPER_MODE")
+	if mode == "" {
+		mode = "run"
+	}
 	os.Exit(realMain([]string{
-		"run", "--state-dir", os.Getenv("PORTLEASE_WRAPPER_STATE"),
+		mode, "--state-dir", os.Getenv("PORTLEASE_WRAPPER_STATE"),
 		"--", "sh", "-c", os.Getenv("PORTLEASE_WRAPPER_SCRIPT"),
 	}, os.Stdout, os.Stderr))
 }
@@ -33,6 +37,38 @@ func wrapperCommand(t *testing.T, script string) *exec.Cmd {
 		"PORTLEASE_WRAPPER_SCRIPT="+script,
 	)
 	return cmd
+}
+
+func TestWrapperExitStatus(t *testing.T) {
+	for _, mode := range []string{"run", "exec"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, tt := range []struct {
+				name   string
+				script string
+				want   int
+			}{
+				{"success", "exit 0", 0},
+				{"failure", "exit 42", 42},
+				{"exit255", "exit 255", 255},
+				{"SIGINT", "kill -INT $$", 128 + int(syscall.SIGINT)},
+				{"SIGTERM", "kill -TERM $$", 128 + int(syscall.SIGTERM)},
+				{"SIGHUP", "kill -HUP $$", 128 + int(syscall.SIGHUP)},
+				{"SIGKILL", "kill -KILL $$", 128 + int(syscall.SIGKILL)},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					cmd := wrapperCommand(t, tt.script)
+					cmd.Env = append(cmd.Env, "PORTLEASE_WRAPPER_MODE="+mode)
+					output, err := cmd.CombinedOutput()
+					if cmd.ProcessState == nil {
+						t.Fatalf("wrapper did not run: %v\n%s", err, output)
+					}
+					if got := cmd.ProcessState.ExitCode(); got != tt.want {
+						t.Fatalf("wrapper exit code = %d, want %d (error: %v)\n%s", got, tt.want, err, output)
+					}
+				})
+			}
+		})
+	}
 }
 
 // startWrappedSleeper starts portlease in its own process group, the way agent
