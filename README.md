@@ -9,6 +9,8 @@ Its JSON output names the guarantee of every mode.
 
 ## Build
 
+Requires Go 1.27 or later.
+
 ```bash
 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o portlease .
 ```

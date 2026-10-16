@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -199,5 +200,138 @@ func TestRunChildCanReadTerminal(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("child blocked reading the terminal")
+	}
+}
+
+// TestStartupSignalHelper exercises the supervisor with a signal delivered after
+// Start, while parent-side resource cleanup still keeps it from waiting.
+func TestStartupSignalHelper(t *testing.T) {
+	role := os.Getenv("PORTLEASE_STARTUP_ROLE")
+	if role == "" {
+		return
+	}
+	n, err := strconv.Atoi(os.Getenv("PORTLEASE_STARTUP_SIGNAL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := syscall.Signal(n)
+	marker := os.Getenv("PORTLEASE_STARTUP_MARKER")
+	if role == "start-failure" {
+		cmd := exec.Command(filepath.Join(t.TempDir(), "missing-command"))
+		if _, err := runChild(cmd, func() { t.Fatal("afterStart called after failed Start") }); err == nil {
+			t.Fatal("missing command unexpectedly started")
+		}
+		if err := syscall.Kill(os.Getpid(), sig); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+		os.Exit(99) // Signal notification was left active if execution reaches here.
+	}
+	if role == "child" {
+		// A child may ignore the parent's death signal. It must still receive
+		// the actual signal sent to the wrapper.
+		signal.Ignore(syscall.SIGTERM)
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, sig)
+		if err := os.WriteFile(marker, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		<-signals
+		os.Exit(42)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestStartupSignalHelper$")
+	cmd.Env = append(os.Environ(), "PORTLEASE_STARTUP_ROLE=child")
+	cmd.SysProcAttr = childAttrs()
+	code, err := runChild(cmd, func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(marker); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("child did not become ready for signals")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if err := syscall.Kill(os.Getpid(), sig); err != nil {
+			t.Fatal(err)
+		}
+		// Hold the startup gap open long enough for signal delivery. The
+		// supervisor must queue the signal until it can forward it safely.
+		time.Sleep(100 * time.Millisecond)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Exit(code)
+}
+
+func TestChildReceivesSignalDuringStartup(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP} {
+		t.Run(sig.String(), func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "child.pid")
+			cmd := exec.Command(os.Args[0], "-test.run=^TestStartupSignalHelper$")
+			cmd.Env = append(os.Environ(),
+				"PORTLEASE_STARTUP_ROLE=wrapper",
+				"PORTLEASE_STARTUP_SIGNAL="+strconv.Itoa(int(sig)),
+				"PORTLEASE_STARTUP_MARKER="+marker,
+			)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			waited := false
+			t.Cleanup(func() {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				if !waited {
+					<-done
+				}
+			})
+			select {
+			case err := <-done:
+				waited = true
+				if got := cmd.ProcessState.ExitCode(); got != 42 {
+					data, _ := os.ReadFile(marker)
+					pid, _ := strconv.Atoi(string(data))
+					t.Fatalf("wrapper exit = %d, want child exit 42 (error: %v, child still running: %t)", got, err, pid > 0 && !processGone(pid))
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("wrapper did not forward the startup signal")
+			}
+			data, err := os.ReadFile(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err := strconv.Atoi(string(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !processGone(pid) {
+				t.Fatalf("child %d survived its wrapper", pid)
+			}
+		})
+	}
+}
+
+func TestChildStartFailureRestoresSignals(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP} {
+		t.Run(sig.String(), func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestStartupSignalHelper$")
+			cmd.Env = append(os.Environ(),
+				"PORTLEASE_STARTUP_ROLE=start-failure",
+				"PORTLEASE_STARTUP_SIGNAL="+strconv.Itoa(int(sig)),
+			)
+			output, err := cmd.CombinedOutput()
+			if cmd.ProcessState == nil {
+				t.Fatalf("wrapper did not run: %v\n%s", err, output)
+			}
+			status := cmd.ProcessState.Sys().(syscall.WaitStatus)
+			if !status.Signaled() || status.Signal() != sig {
+				t.Fatalf("wrapper status = %v, want termination by %v (error: %v)\n%s", status, sig, err, output)
+			}
+		})
 	}
 }

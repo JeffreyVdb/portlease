@@ -314,18 +314,14 @@ func execCommand(args []string, stderr io.Writer) (int, error) {
 	cmd.Env = append(os.Environ(), env...)
 	cmd.ExtraFiles = files
 	cmd.SysProcAttr = childAttrs()
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start child: %w", err)
-	}
-	// Start has duplicated ExtraFiles into the child. The child now owns the
-	// kernel reservation, so the parent's copies can be closed without a gap.
-	for _, file := range files {
-		_ = file.Close()
-	}
-	r.Close()
-	return waitForChild(cmd)
+	return runChild(cmd, func() {
+		// Start has duplicated ExtraFiles into the child. The child now owns the
+		// kernel reservation, so the parent's copies can be closed without a gap.
+		for _, file := range files {
+			_ = file.Close()
+		}
+		r.Close()
+	})
 }
 
 func runCommand(args []string, stderr io.Writer) (int, error) {
@@ -382,18 +378,13 @@ func runCommand(args []string, stderr io.Writer) (int, error) {
 	// an unavoidable race with non-cooperating processes, while the state lease
 	// prevents every other portlease caller from choosing these port numbers.
 	r.Close()
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start child: %w", err)
-	}
-	return waitForChild(cmd)
+	return runChild(cmd, nil)
 }
 
 // childAttrs keeps the child in portlease's process group, so it shares the
 // terminal's foreground status and dies with any kill aimed at the group.
 // Pdeathsig covers a kill aimed only at portlease's PID. The kernel ties it to
-// the thread that forked the child, so callers lock the OS thread from Start
+// the thread that forked the child, so runChild locks the OS thread from Start
 // until the child has been waited for.
 func childAttrs() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
@@ -409,9 +400,22 @@ func terminalForeground() bool {
 	return errno == 0 && int(pgrp) == syscall.Getpgrp()
 }
 
-func waitForChild(cmd *exec.Cmd) (int, error) {
+// runChild supervises the child from startup through Wait. afterStart releases
+// any parent-owned resources once the child has inherited them.
+func runChild(cmd *exec.Cmd, afterStart func()) (int, error) {
+	// Capture signals before Start so none can terminate the wrapper between
+	// spawning the child and starting the forwarding goroutine.
 	signals := make(chan os.Signal, 4)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := cmd.Start(); err != nil {
+		signal.Stop(signals)
+		return 0, fmt.Errorf("start child: %w", err)
+	}
+	if afterStart != nil {
+		afterStart()
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
