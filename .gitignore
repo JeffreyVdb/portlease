@@ -1,0 +1,12 @@
+# Local build outputs
+/bin/
+/portlease
+*.test
+coverage.out
+
+# Local environment files and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
