@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 var version = "dev"
@@ -311,7 +313,9 @@ func execCommand(args []string, stderr io.Writer) (int, error) {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), env...)
 	cmd.ExtraFiles = files
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = childAttrs()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("start child: %w", err)
 	}
@@ -373,15 +377,36 @@ func runCommand(args []string, stderr io.Writer) (int, error) {
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), env...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = childAttrs()
 	// Ordinary applications need to call bind themselves. Closing here leaves
 	// an unavoidable race with non-cooperating processes, while the state lease
 	// prevents every other portlease caller from choosing these port numbers.
 	r.Close()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("start child: %w", err)
 	}
 	return waitForChild(cmd)
+}
+
+// childAttrs keeps the child in portlease's process group, so it shares the
+// terminal's foreground status and dies with any kill aimed at the group.
+// Pdeathsig covers a kill aimed only at portlease's PID. The kernel ties it to
+// the thread that forked the child, so callers lock the OS thread from Start
+// until the child has been waited for.
+func childAttrs() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
+}
+
+// terminalForeground reports whether portlease's process group owns the
+// terminal on stdin. The child shares that group, so the kernel has already
+// delivered any terminal-generated SIGINT to it.
+func terminalForeground() bool {
+	var pgrp int32
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, 0,
+		uintptr(syscall.TIOCGPGRP), uintptr(unsafe.Pointer(&pgrp)))
+	return errno == 0 && int(pgrp) == syscall.Getpgrp()
 }
 
 func waitForChild(cmd *exec.Cmd) (int, error) {
@@ -391,9 +416,13 @@ func waitForChild(cmd *exec.Cmd) (int, error) {
 	go func() {
 		defer close(done)
 		for sig := range signals {
-			if unixSignal, ok := sig.(syscall.Signal); ok {
-				_ = syscall.Kill(-cmd.Process.Pid, unixSignal)
+			// Forwarding a Ctrl-C the child already received would make
+			// tools that treat a second interrupt as "force quit" skip
+			// their graceful shutdown.
+			if sig == os.Interrupt && terminalForeground() {
+				continue
 			}
+			_ = cmd.Process.Signal(sig)
 		}
 	}()
 	err := cmd.Wait()
