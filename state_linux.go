@@ -17,7 +17,7 @@ import (
 
 type lease struct {
 	Result    result    `json:"reservation"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	ExpiresAt time.Time `json:"expires_at,omitzero"`
 	OwnerPID  int       `json:"owner_pid,omitempty"`
 	OwnerBoot string    `json:"owner_start_time,omitempty"`
 }

@@ -316,6 +316,55 @@ func TestListUsesEmptyArray(t *testing.T) {
 	}
 }
 
+func TestListLeaseExpiry(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		expires time.Time
+	}{
+		{name: "supervised"},
+		{name: "ttl", expires: time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), "state")
+			s, err := newStore(stateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.update(func(st *state) error {
+				st.Leases = append(st.Leases, lease{
+					Result: result{LeaseID: tt.name}, ExpiresAt: tt.expires,
+					OwnerPID: os.Getpid(), OwnerBoot: processStart(os.Getpid()),
+				})
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := realMain([]string{"list", "--state-dir", stateDir}, &stdout, &stderr); code != 0 {
+				t.Fatalf("list exit %d: %s", code, stderr.String())
+			}
+			var got struct {
+				Leases []map[string]json.RawMessage `json:"leases"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Leases) != 1 {
+				t.Fatalf("expected one lease: %s", stdout.String())
+			}
+			expiry, present := got.Leases[0]["expires_at"]
+			if tt.expires.IsZero() {
+				if present {
+					t.Fatalf("supervised lease has expires_at: %s", expiry)
+				}
+			} else if want := `"` + tt.expires.Format(time.RFC3339) + `"`; string(expiry) != want {
+				t.Fatalf("expires_at = %s, want %s", expiry, want)
+			}
+		})
+	}
+}
+
 func TestHelpIsAgentFriendlyAndSuccessful(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := realMain([]string{"--help"}, &stdout, &stderr)
